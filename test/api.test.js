@@ -604,6 +604,66 @@ test('采购报价组合：无可行组合返回 200 + feasible:false 与具体�
   }
 });
 
+test('采购报价组合：大整数同价方案不被误剪（备料接入，8 页/2 张/1 亿份/每包 99999996）', async () => {
+  const srv = await startServer();
+  try {
+    // 8 页每帖 2 张 -> 每份 2 张；1 亿份、开机与过程损耗 0、每包 99999996 张：
+    // 毛需求 200000000 -> 整包采购 3 包 = 299999988 张，采购需求沿用备料结果。
+    const prep = { copies: 100000000, makereadySheets: 0, processWasteRate: 0, sheetsPerPack: 99999996 };
+    const res = await postJson(`${srv.baseUrl}/api/impose`, {
+      ...BASE,
+      materialPrep: prep,
+      purchaseQuotes: {
+        quotes: [
+          { supplier: 'A', sheetsPerPack: 99999995, pricePerPackCents: 999999959, minPacks: 0, maxPacks: 3 },
+          { supplier: 'B', sheetsPerPack: 99999996, pricePerPackCents: 999999969, minPacks: 0, maxPacks: 2 },
+          { supplier: 'C', sheetsPerPack: 99999996, pricePerPackCents: 999999969, minPacks: 0, maxPacks: 2 },
+        ],
+      },
+    });
+    assert.equal(res.status, 200);
+    assert.equal(res.body.materialPrep.totals.purchaseSheets, 299999988);
+    const pq = res.body.purchaseQuotes;
+    assert.equal(pq.enabled, true);
+    assert.equal(pq.feasible, true);
+    assert.equal(pq.demandSource, 'materialPrep');
+    assert.equal(pq.demandSheets, 299999988);
+    // B/C 同价且每张比 A 便宜；3 包恰好满足，更早录入的 B 买更多 -> 0/2/1
+    assert.deepEqual(pq.rows.map((r) => r.supplier), ['A', 'B', 'C']);
+    assert.deepEqual(pq.rows.map((r) => r.packs), [0, 2, 1]);
+    assert.deepEqual(pq.rows.map((r) => r.sheets), [0, 199999992, 99999996]);
+    assert.deepEqual(pq.rows.map((r) => r.amountCents), [0, 1999999938, 999999969]);
+    assert.deepEqual(pq.rows.map((r) => r.remainingPacks), [3, 0, 1]);
+    assert.equal(pq.totals.totalPacks, 3);
+    assert.equal(pq.totals.totalSheets, 299999988);
+    assert.equal(pq.totals.overPurchaseSheets, 0);
+    assert.equal(pq.totals.totalCostCents, 2999999907);
+    assert.equal(pq.totals.supplierCount, 2);
+    assert.deepEqual(pq.totals.suppliers, ['B', 'C']);
+
+    // 手工填写需求沿用同一求解规则（手工需求上限 1 亿，用落在上限内的
+    // 同型需求验证：A 每张更贵不入选，B/C 同价时更早录入的 B 买更多）
+    const manualDemand = 99999996; // 1 包 B/C 恰好满足，A 每包少 1 张会超购
+    const manual = await postJson(`${srv.baseUrl}/api/impose`, {
+      ...BASE,
+      purchaseQuotes: {
+        demandSheets: manualDemand,
+        quotes: [
+          { supplier: 'A', sheetsPerPack: 99999995, pricePerPackCents: 999999959, minPacks: 0, maxPacks: 3 },
+          { supplier: 'B', sheetsPerPack: 99999996, pricePerPackCents: 999999969, minPacks: 0, maxPacks: 2 },
+          { supplier: 'C', sheetsPerPack: 99999996, pricePerPackCents: 999999969, minPacks: 0, maxPacks: 2 },
+        ],
+      },
+    });
+    assert.equal(manual.status, 200);
+    assert.equal(manual.body.purchaseQuotes.demandSource, 'manual');
+    assert.deepEqual(manual.body.purchaseQuotes.rows.map((r) => r.packs), [0, 1, 0]);
+    assert.equal(manual.body.purchaseQuotes.totals.overPurchaseSheets, 0);
+  } finally {
+    await srv.close();
+  }
+});
+
 test('采购报价组合：最少包数强制边界与超购选择经接口生效', async () => {
   const srv = await startServer();
   try {
