@@ -43,9 +43,12 @@
  *   录入顺序向量按 B 进制拆为 4 个精确 double 分量做字典序比较，
  *   并逐阶段记录来源张数用于方案回溯。
  * - 枚举引擎（cap 更大时，典型为真实印刷包型 250～520 张/包、需求上千万）：
- *   取每分单价最便宜（cross-product 比较，同价取录入最早）的报价为整包
- *   兜底供应商，DFS 其余报价在窗口内的额外包数，叶节点由兜底整包补足；
- *   每个节点用「每张 cross-product 金额下界」剪枝，节点数有预算护栏。
+ *   取每分单价最便宜（BigInt cross-product 比较——p·s 可达 1e9×1e8 = 1e17 > 2^53，
+ *   绝不能用 double 乘法，否则实际略贵的报价会因舍入同价被误选为兜底供应商；
+ *   同价取录入最早）的报价为整包兜底供应商，DFS 其余报价在窗口内的额外包数，
+ *   叶节点由兜底整包补足；每个节点用「每张 BigInt cross-product 金额下界」剪枝，
+ *   下界严格大于当前最优总价才丢弃（等于时保留：同价方案仍可能凭超购 / 供应商数 /
+ *   录入顺序更优），节点数有预算护栏。
  *
  * 两引擎的正确性均由随机全枚举暴力对照测试保证（稠密引擎为本模块
  * purchaseQuote.test.js 中的 4000 组；枚举键 / 剪枝另经 10 万组原型对照）。
@@ -354,10 +357,15 @@ function solveDense({ n, mins, extra, sizes, prices, minCost, baseMask, required
  */
 function solveEnum({ n, mins, extra, sizes, prices, minCost, required, sMax }) {
   // 每分单价比较：p_i·s_j < p_j·s_i ⇔ i 更便宜；同价取录入更早。
+  // 必须全程 BigInt：p 最大 1e9、s 最大 1e8，乘积可达 1e17 > 2^53，
+  // 用 double 相乘会把实际相差个位数的两个乘积舍入为同值，误把略贵的
+  // 报价当成最便宜兜底供应商（进而用错误的高单价做下界剪枝，丢掉同价优解）。
+  const sizeBigs = sizes.map((s) => BigInt(s));
+  const priceBigs = prices.map((p) => BigInt(p));
   let bulk = 0;
   for (let i = 1; i < n; i += 1) {
-    const lhs = prices[i] * sizes[bulk];
-    const rhs = prices[bulk] * sizes[i];
+    const lhs = priceBigs[i] * sizeBigs[bulk];
+    const rhs = priceBigs[bulk] * sizeBigs[i];
     if (lhs < rhs || (lhs === rhs && i < bulk)) bulk = i;
   }
   const sBulk = sizes[bulk];
@@ -410,8 +418,11 @@ function solveEnum({ n, mins, extra, sizes, prices, minCost, required, sMax }) {
       return;
     }
     // 每张金额下界（BigInt cross-product，精确不高估）：
-    // 还缺 ≥1 张时，任何补足方式每分单价都不低于兜底，故补到满足需求的
-    // 金额至少 ceil(need·p_b/s_b) 分；已花 + 该下界高于当前最优即可剪枝。
+    // 还缺 ≥1 张时，任何补足方式每分单价都不低于兜底（全局最便宜报价），
+    // 故补到满足需求的金额至少 ceil(need·p_b/s_b) 分（连续松弛：分包整数约束
+    // 只会让真实最优更贵，不会更便宜）；已花 + 该下界高于当前最优即可剪枝。
+    // 必须「严格大于」才剪：下界等于最优总价时该子树仍可能存在总价并列、
+    // 但超购更少 / 供应商更少 / 录入顺序更优的方案，不能排除任何同价方案。
     if (best && restSheets < required) {
       const needBig = BigInt(required - restSheets);
       const lbBig = BigInt(minCost) + BigInt(restCost) + (needBig * pBulkBig + sBulkBig - 1n) / sBulkBig;

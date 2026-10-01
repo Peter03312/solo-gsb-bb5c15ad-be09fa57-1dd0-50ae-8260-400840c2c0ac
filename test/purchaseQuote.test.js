@@ -560,6 +560,141 @@ test('枚举引擎大规模真实用例：性能与结果正确（4146 万张 < 
   assert.ok(r.totals.totalSheets >= 41460000);
 });
 
+test('枚举引擎大整数同价回归：double cross-product 精度丢失时仍按录入顺序选 (0,2,1) 而非 (0,1,2)', () => {
+  // 8 页、每帖 2 张（1 帖 2 张），备料 1 亿份、开机/过程损耗 0、每包 99999996 张：
+  // 需领 2e8 张 → ceil 后 3 包 → 采购需求 299999988 张（采购需求沿用备料结果）。
+  // A 实际略贵（pA·sB 与 pB·sA 精确相差 9，比例差仅 9/1e17），double 乘法下两乘积
+  // 均舍入为 99999991900000160 → A 被误判为同价兜底；用 A 的高单价做下界剪枝又会
+  // 丢掉 (0,2,1) 子树。修复后：兜底取 B，方案 0/2/1（更早的 B 比 C 多买 1 包）。
+  const quotes = [
+    q('A', 99999995, 999999959, 0, 3),
+    q('B', 99999996, 999999969, 0, 2),
+    q('C', 99999996, 999999969, 0, 2),
+  ];
+  const demand = 299999988;
+
+  // 手工需求与备料接入使用同一求解规则（demandSheets 表单上限 1 亿；> 1 亿的
+  // 备料采购张数只能经 attach 回退进入，直接以规范化报价调用求解器验证同一规则）
+  const manual = solveQuoteCombination(demand, quotes);
+  assert.equal(manual.feasible, true);
+  assert.deepEqual(manual.rows.map((r) => r.packs), [0, 2, 1]);
+  assert.equal(manual.totals.totalSheets, 299999988);
+  assert.equal(manual.totals.overPurchaseSheets, 0);
+  assert.equal(manual.totals.totalCostCents, 2999999907);
+  assert.equal(manual.totals.supplierCount, 2);
+  assert.deepEqual(manual.totals.suppliers, ['B', 'C']);
+
+  const attached = attachPurchaseQuotes(null, { enabled: true, demandSheets: null, quotes }, demand);
+  assert.equal(attached.demandSource, 'materialPrep');
+  assert.deepEqual(attached.rows.map((r) => r.packs), [0, 2, 1]);
+});
+
+test('枚举引擎大整数同价回归：同价三条报价按录入顺序装满最早报价', () => {
+  // p/s 严格相同（cross-product 精确相等）：100000000 张/包、1000000000 分/包。
+  // 需求 250000000，A 上限 1、B/C 上限 2 → 3 包恰好；[1,0,2] 与 [1,2,0] 等同价
+  // 同超购同家数，录入顺序选 B 装满 → [1,2,0]。
+  const quotes = [
+    q('A', 100000000, 1000000000, 0, 1),
+    q('B', 100000000, 1000000000, 0, 2),
+    q('C', 100000000, 1000000000, 0, 2),
+  ];
+  const r = solveQuoteCombination(250000000, quotes);
+  assert.equal(r.feasible, true);
+  assert.deepEqual(r.rows.map((x) => x.packs), [1, 2, 0]);
+  assert.equal(r.totals.overPurchaseSheets, 50000000);
+  assert.equal(r.totals.supplierCount, 2);
+});
+
+test('枚举引擎大整数暴力对照：包型 ~1e8 / 价格 ~1e9（cross-product > 2^53）解与全枚举一致', () => {
+  // 稠密阈值远小于窗口（cap ≈ 3e8），强制枚举引擎；各报价仅 0~4 包，5^4=625 可暴力。
+  // 包型与价格取业务上限量级，单价 cross-product 达 1e17（超过 2^53），专打
+  // 「double 乘法舍入 → 兜底误选 + 错误下界剪枝」的精度缺陷。
+  const rng = makeRng(424242);
+  const CASES = 250;
+  const bruteForceBig = (demandD, qs) => {
+    const demand = BigInt(demandD);
+    const ss = qs.map((x) => BigInt(x.sheetsPerPack));
+    const pp = qs.map((x) => BigInt(x.pricePerPackCents));
+    let best = null;
+    const packs = qs.map((x) => x.minPacks);
+    const better = (a, b) => {
+      let ca = 0n; let cb = 0n; let sa = 0n; let sb = 0n;
+      let ua = 0; let ub = 0;
+      for (let i = 0; i < qs.length; i += 1) {
+        ca += BigInt(a[i]) * pp[i]; cb += BigInt(b[i]) * pp[i];
+        sa += BigInt(a[i]) * ss[i]; sb += BigInt(b[i]) * ss[i];
+        if (a[i] > 0) ua += 1;
+        if (b[i] > 0) ub += 1;
+      }
+      if (ca !== cb) return ca < cb;
+      const oa = sa - demand; const ob = sb - demand;
+      if (oa !== ob) return oa < ob;
+      if (ua !== ub) return ua < ub;
+      for (let i = 0; i < a.length; i += 1) if (a[i] !== b[i]) return a[i] > b[i];
+      return false;
+    };
+    (function enumerate(i) {
+      if (i === qs.length) {
+        let sheets = 0n;
+        for (let j = 0; j < qs.length; j += 1) sheets += BigInt(packs[j]) * ss[j];
+        if (sheets >= demand && (!best || better(packs, best))) best = packs.slice();
+        return;
+      }
+      for (let k = qs[i].minPacks; k <= qs[i].maxPacks; k += 1) {
+        packs[i] = k;
+        enumerate(i + 1);
+      }
+    })(0);
+    return best;
+  };
+
+  for (let t = 0; t < CASES; t += 1) {
+    const n = 2 + Math.floor(rng() * 3); // 2 ~ 4 条
+    const names = ['甲', '乙', '丙', '丁'];
+    const quotes = [];
+    for (let i = 0; i < n; i += 1) {
+      const minPacks = rng() < 0.25 ? 1 : 0;
+      const maxPacks = minPacks + Math.floor(rng() * 4); // 额外 0 ~ 3 包
+      quotes.push({
+        supplier: names[i],
+        sheetsPerPack: 99999000 + Math.floor(rng() * 10001), // 99,999,000 ~ 100,000,000
+        pricePerPackCents: 999990000 + Math.floor(rng() * 10001), // 单价 ~10 分/张
+        minPacks,
+        maxPacks: Math.max(1, maxPacks),
+      });
+    }
+    // 需求取「约 3 包 + 小幅抖动」，保证既有可行解又不至于一两家就必然包圆
+    const base = 3 * 100000000;
+    const demand = base - 500000 + Math.floor(rng() * 1000001);
+    const res = solveQuoteCombination(demand, quotes);
+    const expected = bruteForceBig(demand, quotes);
+    const maxSheets = quotes.reduce((sum, x) => sum + x.maxPacks * x.sheetsPerPack, 0);
+    if (maxSheets < demand) {
+      assert.equal(res.feasible, false, `big case ${t}: 应不可行`);
+      assert.equal(res.gapSheets, demand - maxSheets);
+      continue;
+    }
+    assert.ok(expected, `big case ${t}: 暴力解应存在`);
+    assert.equal(res.feasible, true, `big case ${t}`);
+    assert.deepEqual(
+      res.rows.map((r) => r.packs),
+      expected,
+      `big case ${t}: demand=${demand} quotes=${JSON.stringify(quotes)}`
+    );
+    assert.equal(
+      res.totals.totalCostCents,
+      expected.reduce((sum, x, i) => sum + x * quotes[i].pricePerPackCents, 0),
+      `big case ${t} 金额`
+    );
+    assert.equal(
+      res.totals.overPurchaseSheets,
+      expected.reduce((sum, x, i) => sum + x * quotes[i].sheetsPerPack, 0) - demand,
+      `big case ${t} 超购`
+    );
+    assert.equal(res.totals.supplierCount, expected.filter((x) => x > 0).length, `big case ${t} 供应商数`);
+  }
+});
+
 test('稠密引擎同价小包型退化用例：大窗口下结果精确、金额按分无浮点误差', () => {
   // 三家每分单价完全相同（2 张 2 分 / 3 张 3 分 / 5 张 5 分），需求 50000：
   // 窗口 > 稠密阈值会改走枚举，故此处需求取稠密引擎覆盖范围内的较大值。

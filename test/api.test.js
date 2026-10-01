@@ -552,6 +552,44 @@ test('采购报价组合：缺省需求张数时接入印刷备料整包采购�
   }
 });
 
+test('采购报价组合：大整数同价方案不被误选（备料接入需求，页面/导出同一 JSON 契约）', async () => {
+  const srv = await startServer();
+  try {
+    // 8 页、每帖 2 张；备料 1 亿份、开机/过程损耗 0、每包 99999996 张：
+    // 需领 2e8 张 → 3 包 → purchaseSheets 299999988，采购需求沿用该结果。
+    // A 每包 99999995 张 / 999999959 分（实际略贵 9/(1e17) 分每分单价），
+    // B、C 均 99999996 张 / 999999969 分（精确同价）。
+    // 0/2/1 与 0/1/2 总价、超购(0)、供应商数(2) 全并列，录入更早的 B 应买 2 包。
+    const res = await postJson(`${srv.baseUrl}/api/impose`, {
+      ...BASE,
+      materialPrep: { copies: 100000000, makereadySheets: 0, processWasteRate: 0, sheetsPerPack: 99999996 },
+      purchaseQuotes: {
+        quotes: [
+          { supplier: 'A', sheetsPerPack: 99999995, pricePerPackCents: 999999959, minPacks: 0, maxPacks: 3 },
+          { supplier: 'B', sheetsPerPack: 99999996, pricePerPackCents: 999999969, minPacks: 0, maxPacks: 2 },
+          { supplier: 'C', sheetsPerPack: 99999996, pricePerPackCents: 999999969, minPacks: 0, maxPacks: 2 },
+        ],
+      },
+    });
+    assert.equal(res.status, 200);
+    assert.equal(res.body.materialPrep.totals.purchaseSheets, 299999988);
+    const pq = res.body.purchaseQuotes;
+    assert.equal(pq.demandSource, 'materialPrep');
+    assert.equal(pq.demandSheets, 299999988);
+    assert.equal(pq.feasible, true);
+    assert.deepEqual(pq.rows.map((r) => r.packs), [0, 2, 1]);
+    assert.deepEqual(pq.rows.map((r) => r.sheets), [0, 199999992, 99999996]);
+    assert.deepEqual(pq.rows.map((r) => r.amountCents), [0, 1999999938, 999999969]);
+    assert.equal(pq.totals.totalSheets, 299999988);
+    assert.equal(pq.totals.overPurchaseSheets, 0);
+    assert.equal(pq.totals.totalCostCents, 2999999907);
+    assert.equal(pq.totals.supplierCount, 2);
+    assert.deepEqual(pq.totals.suppliers, ['B', 'C']);
+  } finally {
+    await srv.close();
+  }
+});
+
 test('采购报价组合：手工需求张数优先于备料整包采购张数', async () => {
   const srv = await startServer();
   try {
